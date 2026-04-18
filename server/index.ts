@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { createHash } from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
 import { diagnosticData } from '../src/data/diagnostics';
@@ -48,6 +49,73 @@ type ApiHistoryItem = {
   role: 'user' | 'assistant';
   content: string;
 };
+
+const GEMINI_CACHE_TTL_MS = 10 * 60 * 1000;
+const GEMINI_CACHE_MAX_ENTRIES = 200;
+const geminiCache = new Map<string, { expiresAt: number; value: unknown }>();
+
+function nowMs(): number {
+  return Date.now();
+}
+
+function hashText(text: string): string {
+  return createHash('sha256').update(text).digest('hex');
+}
+
+function cacheGet<T>(key: string): T | null {
+  const entry = geminiCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= nowMs()) {
+    geminiCache.delete(key);
+    return null;
+  }
+  return entry.value as T;
+}
+
+function cacheSet(key: string, value: unknown, ttlMs = GEMINI_CACHE_TTL_MS): void {
+  if (geminiCache.size >= GEMINI_CACHE_MAX_ENTRIES) {
+    geminiCache.clear();
+  }
+  geminiCache.set(key, { expiresAt: nowMs() + ttlMs, value });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchWithBackoff(
+  url: string,
+  init: RequestInit,
+  opts: { maxRetries: number; baseDelayMs: number; retryStatuses: number[] },
+): Promise<Response> {
+  let attempt = 0;
+  let lastError: unknown;
+
+  while (attempt <= opts.maxRetries) {
+    try {
+      const res = await fetch(url, init);
+      if (!opts.retryStatuses.includes(res.status) || attempt === opts.maxRetries) {
+        return res;
+      }
+
+      // Exponential backoff with a small jitter.
+      const jitter = Math.floor(Math.random() * 120);
+      const delay = opts.baseDelayMs * 2 ** attempt + jitter;
+      await sleep(delay);
+      attempt++;
+      continue;
+    } catch (err) {
+      lastError = err;
+      if (attempt === opts.maxRetries) break;
+      const jitter = Math.floor(Math.random() * 120);
+      const delay = opts.baseDelayMs * 2 ** attempt + jitter;
+      await sleep(delay);
+      attempt++;
+    }
+  }
+
+  throw lastError ?? new Error('fetch failed');
+}
 
 function looksAutomotive(text: string): boolean {
   const t = text.toLowerCase();
@@ -559,14 +627,22 @@ async function diagnoseWithGemini(text: string, lang: Lang, history?: ApiHistory
 
   let lastErrorStatus: number | undefined;
 
+  const cacheKey = `diag:${lang}:${hashText(prompt)}`;
+  const cachedDiagnosis = cacheGet<ApiDiagnosis>(cacheKey);
+  if (cachedDiagnosis) return { diagnosis: cachedDiagnosis };
+
   for (const model of modelsToTry) {
     try {
       const url = `https://generativelanguage.googleapis.com/v1beta/${encodeModelPath(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
+      const res = await fetchWithBackoff(
+        url,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        },
+        { maxRetries: 2, baseDelayMs: 400, retryStatuses: [429, 503] },
+      );
 
       if (!res.ok) {
         // eslint-disable-next-line no-console
@@ -584,6 +660,7 @@ async function diagnoseWithGemini(text: string, lang: Lang, history?: ApiHistory
       const jsonText = extractFirstJsonObject(outputText) ?? outputText;
       const parsed = JSON.parse(jsonText) as unknown;
       if (!isValidDiagnosis(parsed)) return { diagnosis: null, errorStatus: 502 };
+      cacheSet(cacheKey, parsed);
       return { diagnosis: parsed };
     } catch {
       // Network/JSON parse/etc. Keep server alive and fall back gracefully.
@@ -643,14 +720,22 @@ async function answerWithGemini(text: string, lang: Lang, history?: ApiHistoryIt
 
   let lastErrorStatus: number | undefined;
 
+  const cacheKey = `text:${lang}:${hashText(prompt)}`;
+  const cachedText = cacheGet<string>(cacheKey);
+  if (cachedText) return { text: cachedText };
+
   for (const model of modelsToTry) {
     try {
       const url = `https://generativelanguage.googleapis.com/v1beta/${encodeModelPath(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
+      const res = await fetchWithBackoff(
+        url,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        },
+        { maxRetries: 2, baseDelayMs: 400, retryStatuses: [429, 503] },
+      );
 
       if (!res.ok) {
         // eslint-disable-next-line no-console
@@ -663,7 +748,9 @@ async function answerWithGemini(text: string, lang: Lang, history?: ApiHistoryIt
       const json = (await res.json()) as GeminiGenerateResponse;
       const outputText = json.candidates?.[0]?.content?.parts?.map((p) => p.text ?? '').join('') ?? '';
       if (!outputText.trim()) return { text: null, errorStatus: 502 };
-      return { text: outputText.trim() };
+      const finalText = outputText.trim();
+      cacheSet(cacheKey, finalText);
+      return { text: finalText };
     } catch {
       lastErrorStatus = lastErrorStatus ?? 502;
       continue;
@@ -738,14 +825,16 @@ app.post('/api/diagnose', (req, res) => {
           }
 
           if (aiAnswer.errorStatus) {
+            // If Gemini is temporarily unavailable, fall back to a helpful automotive-style clarifying flow.
+            if (aiAnswer.errorStatus === 429 || aiAnswer.errorStatus === 503 || aiAnswer.errorStatus === 502) {
+              res.json({ match: true, diagnosis: buildClarifyingDiagnosis(lang) } satisfies DiagnoseResponse);
+              return;
+            }
+
             const message =
               lang === 'ar'
-                ? aiAnswer.errorStatus === 429
-                  ? 'Gemini وصلت للحد (429). جرّب بعد شوية.'
-                  : `تعذر الاتصال بـ Gemini (HTTP ${aiAnswer.errorStatus}). تأكد من صلاحية المفتاح وتفعيل Gemini API.`
-                : aiAnswer.errorStatus === 429
-                  ? 'Gemini is rate-limited (429). Try again later.'
-                  : `Gemini request failed (HTTP ${aiAnswer.errorStatus}). Check API key and that Gemini API is enabled.`;
+                ? `تعذر الاتصال بـ Gemini (HTTP ${aiAnswer.errorStatus}). تأكد من صلاحية المفتاح وتفعيل Gemini API.`
+                : `Gemini request failed (HTTP ${aiAnswer.errorStatus}). Check API key and that Gemini API is enabled.`;
 
             res.json({ match: false, message } satisfies DiagnoseResponse);
             return;
